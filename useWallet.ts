@@ -1,170 +1,190 @@
-import { useState, useEffect, useCallback } from "react";
-import { createPublicClient, createWalletClient, custom, http } from "viem";
-import { ARC_TESTNET, CONTRACTS, ERC20_ABI, formatUsdc } from "./arc";
+import { useState, useEffect, useCallback } from 'react';
+
+// Arc Testnet chain config
+export const ARC_TESTNET = {
+  chainId: '0x4CE252', // 5042002 in hex
+  chainIdDecimal: 5042002,
+  chainName: 'Arc Testnet',
+  nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 6 },
+  rpcUrls: ['https://rpc.testnet.arc.network'],
+  blockExplorerUrls: ['https://testnet.arcscan.app'],
+};
+
+export const ETHEREUM_SEPOLIA = {
+  chainId: '0xaa36a7',
+  chainIdDecimal: 11155111,
+  chainName: 'Ethereum Sepolia',
+  nativeCurrency: { name: 'Ethereum', symbol: 'ETH', decimals: 18 },
+  rpcUrls: ['https://rpc.sepolia.org'],
+  blockExplorerUrls: ['https://sepolia.etherscan.io'],
+};
+
+export const BASE_SEPOLIA = {
+  chainId: '0x14a34',
+  chainIdDecimal: 84532,
+  chainName: 'Base Sepolia',
+  nativeCurrency: { name: 'Ethereum', symbol: 'ETH', decimals: 18 },
+  rpcUrls: ['https://sepolia.base.org'],
+  blockExplorerUrls: ['https://sepolia-explorer.base.org'],
+};
 
 export interface WalletState {
   address: string | null;
-  isConnected: boolean;
+  chainId: number | null;
+  walletType: 'metamask' | 'phantom' | null;
   isConnecting: boolean;
   error: string | null;
-  usdcBalance: string;
-  eurcBalance: string;
-  walletType: "metamask" | "phantom" | null;
 }
 
 export function useWallet() {
   const [state, setState] = useState<WalletState>({
     address: null,
-    isConnected: false,
+    chainId: null,
+    walletType: null,
     isConnecting: false,
     error: null,
-    usdcBalance: "0.00",
-    eurcBalance: "0.00",
-    walletType: null,
   });
 
-  const getPublicClient = useCallback(() => {
-    return createPublicClient({
-      chain: ARC_TESTNET as any,
-      transport: http("https://rpc.testnet.arc.network"),
-    });
+  const getEthereum = () => {
+    if (typeof window === 'undefined') return null;
+    return (window as any).ethereum;
+  };
+
+  const getPhantomEthereum = () => {
+    if (typeof window === 'undefined') return null;
+    const phantom = (window as any).phantom;
+    return phantom?.ethereum ?? null;
+  };
+
+  const updateChain = useCallback(async (provider: any) => {
+    try {
+      const chainIdHex = await provider.request({ method: 'eth_chainId' });
+      const chainId = parseInt(chainIdHex, 16);
+      setState(prev => ({ ...prev, chainId }));
+    } catch {}
   }, []);
 
-  const fetchBalances = useCallback(async (address: string) => {
-    try {
-      const client = getPublicClient();
-      const [usdcRaw, eurcRaw] = await Promise.all([
-        client.readContract({
-          address: CONTRACTS.USDC,
-          abi: ERC20_ABI,
-          functionName: "balanceOf",
-          args: [address as `0x${string}`],
-        }) as Promise<bigint>,
-        client.readContract({
-          address: CONTRACTS.EURC,
-          abi: ERC20_ABI,
-          functionName: "balanceOf",
-          args: [address as `0x${string}`],
-        }) as Promise<bigint>,
-      ]);
-      setState((s) => ({
-        ...s,
-        usdcBalance: formatUsdc(usdcRaw),
-        eurcBalance: formatUsdc(eurcRaw),
-      }));
-    } catch {
-      // balance fetch non-critical
+  const connectMetaMask = useCallback(async () => {
+    const ethereum = getEthereum();
+    if (!ethereum) {
+      setState(prev => ({ ...prev, error: 'MetaMask not installed. Please install it from metamask.io' }));
+      return;
     }
-  }, [getPublicClient]);
-
-  const switchToArc = useCallback(async (provider: any) => {
-    const chainIdHex = "0x4CE952";
+    setState(prev => ({ ...prev, isConnecting: true, error: null }));
     try {
-      await provider.request({
-        method: "wallet_switchEthereumChain",
-        params: [{ chainId: chainIdHex }],
+      const accounts = await ethereum.request({ method: 'eth_requestAccounts' });
+      const chainIdHex = await ethereum.request({ method: 'eth_chainId' });
+      setState({
+        address: accounts[0],
+        chainId: parseInt(chainIdHex, 16),
+        walletType: 'metamask',
+        isConnecting: false,
+        error: null,
       });
-    } catch (switchError: any) {
-      if (switchError.code === 4902) {
-        await provider.request({
-          method: "wallet_addEthereumChain",
-          params: [
-            {
-              chainId: chainIdHex,
-              chainName: "Arc Testnet",
-              nativeCurrency: { name: "USDC", symbol: "USDC", decimals: 6 },
-              rpcUrls: ["https://rpc.testnet.arc.network"],
-              blockExplorerUrls: ["https://testnet.arcscan.app"],
-            },
-          ],
-        });
-      } else {
-        throw switchError;
-      }
+    } catch (err: any) {
+      setState(prev => ({ ...prev, isConnecting: false, error: err.message ?? 'Connection rejected' }));
     }
   }, []);
 
-  const connect = useCallback(
-    async (walletType: "metamask" | "phantom" = "metamask") => {
-      setState((s) => ({ ...s, isConnecting: true, error: null }));
-      try {
-        const provider = (window as any).ethereum;
-        if (!provider) {
-          throw new Error(
-            "No wallet found. Please install MetaMask or Phantom."
-          );
-        }
-        await switchToArc(provider);
-        const accounts = await provider.request({
-          method: "eth_requestAccounts",
-        });
-        const address = accounts[0];
-        setState((s) => ({
-          ...s,
-          address,
-          isConnected: true,
-          isConnecting: false,
-          walletType,
-        }));
-        await fetchBalances(address);
-      } catch (err: any) {
-        setState((s) => ({
-          ...s,
-          isConnecting: false,
-          error: err.message || "Connection failed",
-        }));
-      }
-    },
-    [switchToArc, fetchBalances]
-  );
+  const connectPhantom = useCallback(async () => {
+    const phantomEth = getPhantomEthereum();
+    if (!phantomEth) {
+      setState(prev => ({ ...prev, error: 'Phantom wallet not installed. Please install it from phantom.app' }));
+      return;
+    }
+    setState(prev => ({ ...prev, isConnecting: true, error: null }));
+    try {
+      const accounts = await phantomEth.request({ method: 'eth_requestAccounts' });
+      const chainIdHex = await phantomEth.request({ method: 'eth_chainId' });
+      setState({
+        address: accounts[0],
+        chainId: parseInt(chainIdHex, 16),
+        walletType: 'phantom',
+        isConnecting: false,
+        error: null,
+      });
+    } catch (err: any) {
+      setState(prev => ({ ...prev, isConnecting: false, error: err.message ?? 'Connection rejected' }));
+    }
+  }, []);
 
   const disconnect = useCallback(() => {
-    setState({
-      address: null,
-      isConnected: false,
-      isConnecting: false,
-      error: null,
-      usdcBalance: "0.00",
-      eurcBalance: "0.00",
-      walletType: null,
-    });
+    setState({ address: null, chainId: null, walletType: null, isConnecting: false, error: null });
   }, []);
 
-  const refreshBalances = useCallback(() => {
-    if (state.address) fetchBalances(state.address);
-  }, [state.address, fetchBalances]);
+  const switchToChain = useCallback(async (chain: typeof ARC_TESTNET) => {
+    const ethereum = getEthereum();
+    if (!ethereum) return false;
+    try {
+      await ethereum.request({
+        method: 'wallet_switchEthereumChain',
+        params: [{ chainId: chain.chainId }],
+      });
+      return true;
+    } catch (switchError: any) {
+      if (switchError.code === 4902) {
+        try {
+          await ethereum.request({
+            method: 'wallet_addEthereumChain',
+            params: [{
+              chainId: chain.chainId,
+              chainName: chain.chainName,
+              nativeCurrency: chain.nativeCurrency,
+              rpcUrls: chain.rpcUrls,
+              blockExplorerUrls: chain.blockExplorerUrls,
+            }],
+          });
+          return true;
+        } catch { return false; }
+      }
+      return false;
+    }
+  }, []);
 
-  // Listen for account changes
+  // Listen for account / chain changes
   useEffect(() => {
-    const provider = (window as any).ethereum;
-    if (!provider) return;
-    const handleAccountsChanged = (accounts: string[]) => {
-      if (accounts.length === 0) disconnect();
-      else {
-        setState((s) => ({ ...s, address: accounts[0] }));
-        fetchBalances(accounts[0]);
+    const ethereum = getEthereum();
+    if (!ethereum) return;
+
+    const handleAccounts = (accounts: string[]) => {
+      if (accounts.length === 0) {
+        setState(prev => ({ ...prev, address: null, walletType: null }));
+      } else {
+        setState(prev => ({ ...prev, address: accounts[0] }));
       }
     };
-    provider.on?.("accountsChanged", handleAccountsChanged);
-    return () => provider.removeListener?.("accountsChanged", handleAccountsChanged);
-  }, [disconnect, fetchBalances]);
+    const handleChain = (chainIdHex: string) => {
+      setState(prev => ({ ...prev, chainId: parseInt(chainIdHex, 16) }));
+    };
 
-  const getWalletClient = useCallback(() => {
-    const provider = (window as any).ethereum;
-    if (!provider || !state.address) return null;
-    return createWalletClient({
-      account: state.address as `0x${string}`,
-      chain: ARC_TESTNET as any,
-      transport: custom(provider),
-    });
-  }, [state.address]);
+    ethereum.on('accountsChanged', handleAccounts);
+    ethereum.on('chainChanged', handleChain);
+
+    // Auto-reconnect if already authorised
+    ethereum.request({ method: 'eth_accounts' }).then((accounts: string[]) => {
+      if (accounts.length > 0) {
+        updateChain(ethereum);
+        setState(prev => ({
+          ...prev,
+          address: accounts[0],
+          walletType: 'metamask',
+        }));
+      }
+    }).catch(() => {});
+
+    return () => {
+      ethereum.removeListener('accountsChanged', handleAccounts);
+      ethereum.removeListener('chainChanged', handleChain);
+    };
+  }, [updateChain]);
 
   return {
     ...state,
-    connect,
+    connectMetaMask,
+    connectPhantom,
     disconnect,
-    refreshBalances,
-    getPublicClient,
-    getWalletClient,
+    switchToChain,
+    isConnected: !!state.address,
+    isOnArc: state.chainId === ARC_TESTNET.chainIdDecimal,
   };
 }

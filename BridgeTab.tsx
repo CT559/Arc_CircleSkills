@@ -1,369 +1,440 @@
-import { useState } from "react";
-import { EXPLORER } from "../lib/arc";
+import { useState } from 'react';
+
+const ARC_TESTNET_CHAIN_ID = 5042002;
+const EXPLORER = 'https://testnet.arcscan.app';
+
+const SOURCE_CHAINS = [
+  {
+    id: 'Ethereum_Sepolia',
+    label: 'Ethereum Sepolia',
+    chainId: 11155111,
+    icon: '⟠',
+    color: 'blue',
+    type: 'evm',
+  },
+  {
+    id: 'Base_Sepolia',
+    label: 'Base Sepolia',
+    chainId: 84532,
+    icon: '🔵',
+    color: 'indigo',
+    type: 'evm',
+  },
+  {
+    id: 'Solana_Devnet',
+    label: 'Solana Devnet',
+    chainId: null,
+    icon: '◎',
+    color: 'violet',
+    type: 'solana',
+  },
+] as const;
+
+type SourceChainId = typeof SOURCE_CHAINS[number]['id'];
+
+interface BridgeStep {
+  label: string;
+  status: 'pending' | 'active' | 'done' | 'error';
+  txHash?: string;
+}
+
+interface BridgeResult {
+  txHash: string;
+  explorerUrl: string;
+  amount: string;
+  sourceChain: string;
+}
 
 interface Props {
   address: string | null;
-  isConnected: boolean;
-  usdcBalance: string;
-  getPublicClient: () => any;
-  getWalletClient: () => any;
-  refreshBalances: () => void;
+  chainId: number | null;
 }
 
-type SourceChain = "Ethereum_Sepolia" | "Base_Sepolia" | "Solana_Devnet";
-type TxStatus = "idle" | "approving" | "burning" | "attesting" | "minting" | "success" | "error";
+export default function BridgeTab({ address, chainId }: Props) {
+  const [sourceChain, setSourceChain] = useState<SourceChainId>('Ethereum_Sepolia');
+  const [amount, setAmount] = useState('1.00');
+  const [isBridging, setIsBridging] = useState(false);
+  const [steps, setSteps] = useState<BridgeStep[]>([]);
+  const [result, setResult] = useState<BridgeResult | null>(null);
+  const [error, setError] = useState('');
 
-const CHAIN_INFO: Record<SourceChain, { label: string; explorer: string; rpc: string; isSolana: boolean }> = {
-  Ethereum_Sepolia: {
-    label: "Ethereum Sepolia",
-    explorer: "https://sepolia.etherscan.io",
-    rpc: "https://ethereum-sepolia-rpc.publicnode.com",
-    isSolana: false,
-  },
-  Base_Sepolia: {
-    label: "Base Sepolia",
-    explorer: "https://sepolia.basescan.org",
-    rpc: "https://sepolia.base.org",
-    isSolana: false,
-  },
-  Solana_Devnet: {
-    label: "Solana Devnet",
-    explorer: "https://explorer.solana.com/?cluster=devnet",
-    rpc: "https://api.devnet.solana.com",
-    isSolana: true,
-  },
-};
+  const selectedSource = SOURCE_CHAINS.find(c => c.id === sourceChain)!;
+  const isOnSourceChain = selectedSource.type === 'evm'
+    ? chainId === selectedSource.chainId
+    : true; // Solana uses Phantom which is separate
 
-export default function BridgeTab({
-  address,
-  isConnected,
-  usdcBalance,
-  getPublicClient,
-  getWalletClient,
-  refreshBalances,
-}: Props) {
-  const [sourceChain, setSourceChain] = useState<SourceChain>("Ethereum_Sepolia");
-  const [amount, setAmount] = useState("0.01");
-  const [status, setStatus] = useState<TxStatus>("idle");
-  const [txHash, setTxHash] = useState("");
-  const [destTxHash, setDestTxHash] = useState("");
-  const [error, setError] = useState("");
-
-  const chainInfo = CHAIN_INFO[sourceChain];
-
-  const statusLabel: Record<TxStatus, string> = {
-    idle: "",
-    approving: "Approving USDC on source chain…",
-    burning: "Burning USDC via CCTP…",
-    attesting: "Waiting for Circle attestation…",
-    minting: "Minting USDC on Arc Testnet…",
-    success: "Bridge complete!",
-    error: "",
+  const setStep = (index: number, update: Partial<BridgeStep>) => {
+    setSteps(prev => prev.map((s, i) => i === index ? { ...s, ...update } : s));
   };
 
-  const handleBridge = async () => {
-    if (!isConnected || !address) return;
-    setStatus("approving");
-    setError("");
-    setTxHash("");
-    setDestTxHash("");
+  const switchToSourceChain = async () => {
+    if (selectedSource.type !== 'evm' || !selectedSource.chainId) return;
+    const ethereum = (window as any).ethereum;
+    if (!ethereum) return;
+    const chainIdHex = '0x' + selectedSource.chainId.toString(16);
+    try {
+      await ethereum.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: chainIdHex }] });
+    } catch (err: any) {
+      if (err.code === 4902) {
+        const chainConfigs: Record<number, object> = {
+          11155111: {
+            chainId: chainIdHex,
+            chainName: 'Ethereum Sepolia',
+            nativeCurrency: { name: 'Ethereum', symbol: 'ETH', decimals: 18 },
+            rpcUrls: ['https://rpc.sepolia.org'],
+            blockExplorerUrls: ['https://sepolia.etherscan.io'],
+          },
+          84532: {
+            chainId: chainIdHex,
+            chainName: 'Base Sepolia',
+            nativeCurrency: { name: 'Ethereum', symbol: 'ETH', decimals: 18 },
+            rpcUrls: ['https://sepolia.base.org'],
+            blockExplorerUrls: ['https://sepolia-explorer.base.org'],
+          },
+        };
+        await ethereum.request({ method: 'wallet_addEthereumChain', params: [chainConfigs[selectedSource.chainId]] });
+      }
+    }
+  };
+
+  const executeBridge = async () => {
+    if (!address) {
+      setError('Please connect your wallet first');
+      return;
+    }
+    if (!amount || parseFloat(amount) <= 0) {
+      setError('Enter a valid amount');
+      return;
+    }
+
+    const initialSteps: BridgeStep[] = [
+      { label: 'Approve USDC spending', status: 'pending' },
+      { label: 'Burn USDC on source chain (CCTP)', status: 'pending' },
+      { label: 'Waiting for attestation', status: 'pending' },
+      { label: 'Mint USDC on Arc Testnet', status: 'pending' },
+    ];
+    setSteps(initialSteps);
+    setIsBridging(true);
+    setError('');
+    setResult(null);
 
     try {
-      const { AppKit } = await import("@circle-fin/app-kit");
+      // Dynamic import
+      const { AppKit } = await import('@circle-fin/app-kit');
 
-      let viemAdapter: any;
+      setStep(0, { status: 'active' });
 
-      if (!chainInfo.isSolana) {
-        const { createViemV2Adapter } = await import("@circle-fin/adapter-viem-v2");
-        const { createWalletClient, custom } = await import("viem");
+      if (selectedSource.type === 'evm') {
+        const { createViemAdapterFromProvider } = await import('@circle-fin/adapter-viem-v2');
 
-        // Switch MetaMask to source chain
-        const sourceChainId = sourceChain === "Ethereum_Sepolia" ? "0xaa36a7" : "0x14a34";
-        const provider = (window as any).ethereum;
-        try {
-          await provider.request({
-            method: "wallet_switchEthereumChain",
-            params: [{ chainId: sourceChainId }],
-          });
-        } catch (switchErr: any) {
-          if (switchErr.code === 4902) {
-            const chainData =
-              sourceChain === "Base_Sepolia"
-                ? {
-                    chainId: "0x14a34",
-                    chainName: "Base Sepolia",
-                    nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
-                    rpcUrls: ["https://sepolia.base.org"],
-                    blockExplorerUrls: ["https://sepolia.basescan.org"],
-                  }
-                : {
-                    chainId: "0xaa36a7",
-                    chainName: "Ethereum Sepolia",
-                    nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
-                    rpcUrls: ["https://ethereum-sepolia-rpc.publicnode.com"],
-                    blockExplorerUrls: ["https://sepolia.etherscan.io"],
-                  };
-            await provider.request({ method: "wallet_addEthereumChain", params: [chainData] });
-          } else {
-            throw switchErr;
-          }
+        const ethereum = (window as any).ethereum;
+        if (!ethereum) throw new Error('No wallet provider found');
+
+        // Ensure on correct source chain
+        if (!isOnSourceChain) {
+          await switchToSourceChain();
         }
 
-        const sourceChainConfig =
-          sourceChain === "Ethereum_Sepolia"
-            ? {
-                id: 11155111,
-                name: "Ethereum Sepolia",
-                network: "sepolia",
-                nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
-                rpcUrls: { default: { http: [chainInfo.rpc] }, public: { http: [chainInfo.rpc] } },
-              }
-            : {
-                id: 84532,
-                name: "Base Sepolia",
-                network: "base-sepolia",
-                nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
-                rpcUrls: { default: { http: [chainInfo.rpc] }, public: { http: [chainInfo.rpc] } },
-              };
-
-        const wc = createWalletClient({
+        const sourceAdapter = createViemAdapterFromProvider({
+          provider: ethereum,
           account: address as `0x${string}`,
-          chain: sourceChainConfig as any,
-          transport: custom(provider),
         });
-        viemAdapter = createViemV2Adapter(wc, { rpcUrl: chainInfo.rpc });
+
+        setStep(0, { status: 'done' });
+        setStep(1, { status: 'active' });
+
+        // Destination adapter on Arc (switch chain in MetaMask)
+        // For forwarder mode we don't need a destination adapter
+        const kit = new AppKit();
+
+        kit.on?.('approve', (event: any) => {
+          setStep(0, { status: 'done', txHash: event?.values?.txHash });
+          setStep(1, { status: 'active' });
+        });
+        kit.on?.('burn', (event: any) => {
+          setStep(1, { status: 'done', txHash: event?.values?.txHash });
+          setStep(2, { status: 'active' });
+        });
+        kit.on?.('attest', () => {
+          setStep(2, { status: 'done' });
+          setStep(3, { status: 'active' });
+        });
+        kit.on?.('mint', (event: any) => {
+          setStep(3, { status: 'done', txHash: event?.values?.txHash });
+        });
+
+        const bridgeResult = await kit.bridge({
+          from: {
+            adapter: sourceAdapter,
+            chain: sourceChain.replace('_', '_') as any,
+          },
+          to: {
+            recipientAddress: address,
+            chain: 'Arc_Testnet',
+            useForwarder: true,
+          },
+          amount,
+        });
+
+        setSteps(s => s.map(step => ({ ...step, status: step.status === 'pending' ? 'done' : step.status })));
+
+        setResult({
+          txHash: bridgeResult.txHash ?? bridgeResult.sourceTxHash ?? '',
+          explorerUrl: bridgeResult.explorerUrl ?? `${EXPLORER}/tx/${bridgeResult.destinationTxHash ?? ''}`,
+          amount,
+          sourceChain: selectedSource.label,
+        });
       } else {
-        // Solana path — use Phantom
-        const { createSolanaAdapter } = await import("@circle-fin/app-kit");
-        const phantom = (window as any).solana;
-        if (!phantom?.isPhantom) throw new Error("Phantom wallet not found for Solana bridging");
+        // Solana path
+        const { SolanaAdapter } = await import('@circle-fin/adapter-solana');
+        const { Connection, PublicKey } = await import('@solana/web3.js');
+
+        const phantom = (window as any).phantom?.solana;
+        if (!phantom) throw new Error('Phantom wallet not found. Install Phantom from phantom.app');
+
         await phantom.connect();
-        viemAdapter = createSolanaAdapter(phantom, { rpcUrl: chainInfo.rpc });
-      }
+        const publicKey = phantom.publicKey.toString();
 
-      const kit = new AppKit();
-      setStatus("burning");
+        setStep(0, { status: 'done' });
+        setStep(1, { status: 'active' });
 
-      // Circle App Kit bridge (CCTP v2) — from Circle Skills: bridge-stablecoin
-      const result = await kit.bridge({
-        from: { adapter: viemAdapter, chain: sourceChain },
-        to: { adapter: (() => {
-          // We need Arc-side adapter for receiving
-          const { createViemV2Adapter } = require("@circle-fin/adapter-viem-v2");
-          const { createWalletClient, custom } = require("viem");
-          const { ARC_TESTNET } = require("../lib/arc");
-          const provider = (window as any).ethereum;
-          const wc = createWalletClient({
-            account: address as `0x${string}`,
-            chain: ARC_TESTNET as any,
-            transport: custom(provider),
-          });
-          return createViemV2Adapter(wc, { rpcUrl: "https://rpc.testnet.arc.network" });
-        })(), chain: "Arc_Testnet" },
-        amount,
-      });
+        const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
 
-      setTxHash(result.sourceTxHash ?? result.txHash ?? "");
-      setStatus("attesting");
+        const sourceAdapter = new SolanaAdapter({
+          connection,
+          wallet: phantom,
+        });
 
-      // Wait for dest
-      if (result.destTxHash) {
-        setDestTxHash(result.destTxHash);
-        setStatus("success");
-        refreshBalances();
-      } else {
-        // Poll for dest tx
-        let tries = 0;
-        const interval = setInterval(async () => {
-          tries++;
-          try {
-            const fresh = await result.getStatus?.();
-            if (fresh?.destTxHash) {
-              setDestTxHash(fresh.destTxHash);
-              setStatus("success");
-              refreshBalances();
-              clearInterval(interval);
-            } else if (fresh?.status === "complete") {
-              setStatus("success");
-              refreshBalances();
-              clearInterval(interval);
-            }
-          } catch {}
-          if (tries > 40) {
-            clearInterval(interval);
-            setStatus("success"); // Optimistic
-            refreshBalances();
-          }
-        }, 5000);
+        const { createViemAdapterFromProvider } = await import('@circle-fin/adapter-viem-v2');
+        const ethereum = (window as any).ethereum;
+        if (!ethereum) throw new Error('MetaMask required for Arc destination');
+
+        const destAdapter = createViemAdapterFromProvider({
+          provider: ethereum,
+          account: address as `0x${string}`,
+        });
+
+        const kit = new AppKit();
+
+        kit.on?.('burn', () => {
+          setStep(1, { status: 'done' });
+          setStep(2, { status: 'active' });
+        });
+        kit.on?.('attest', () => {
+          setStep(2, { status: 'done' });
+          setStep(3, { status: 'active' });
+        });
+        kit.on?.('mint', (event: any) => {
+          setStep(3, { status: 'done', txHash: event?.values?.txHash });
+        });
+
+        const bridgeResult = await kit.bridge({
+          from: {
+            adapter: sourceAdapter,
+            chain: 'Solana_Devnet',
+          },
+          to: {
+            adapter: destAdapter,
+            chain: 'Arc_Testnet',
+          },
+          amount,
+        });
+
+        setSteps(s => s.map(step => ({ ...step, status: 'done' })));
+        setResult({
+          txHash: bridgeResult.txHash ?? bridgeResult.destinationTxHash ?? '',
+          explorerUrl: bridgeResult.explorerUrl ?? `${EXPLORER}/tx/${bridgeResult.destinationTxHash ?? ''}`,
+          amount,
+          sourceChain: selectedSource.label,
+        });
       }
     } catch (err: any) {
-      setError(err.shortMessage || err.message || "Bridge failed");
-      setStatus("error");
+      const msg = err?.message ?? String(err);
+      if (msg.includes('user rejected') || msg.includes('User denied')) {
+        setError('Transaction rejected by user');
+      } else if (msg.includes('insufficient')) {
+        setError('Insufficient USDC balance on source chain');
+      } else {
+        setError(msg);
+      }
+      setSteps(s => s.map(step => step.status === 'active' ? { ...step, status: 'error' } : step));
+    } finally {
+      setIsBridging(false);
     }
   };
 
   return (
-    <div className="max-w-lg mx-auto">
-      <div className="card p-6 space-y-5">
-        <div className="flex items-center justify-between">
-          <h2 className="text-lg font-semibold text-white">Bridge to Arc Testnet</h2>
-          <span className="text-xs text-gray-500 bg-gray-800 px-2 py-1 rounded">CCTP v2</span>
-        </div>
+    <div className="space-y-6">
+      {/* Header */}
+      <div>
+        <h2 className="text-lg font-semibold text-white">Bridge USDC</h2>
+        <p className="text-sm text-gray-500 mt-0.5">Transfer USDC to Arc Testnet via Circle CCTP</p>
+      </div>
 
+      {/* Card */}
+      <div className="p-6 rounded-2xl bg-white/3 border border-white/10 space-y-5">
         {/* Source chain selector */}
         <div>
-          <label className="text-xs text-gray-400 mb-2 block">From</label>
+          <label className="text-xs text-gray-500 mb-3 block">From</label>
           <div className="grid grid-cols-3 gap-2">
-            {(Object.keys(CHAIN_INFO) as SourceChain[]).map((chain) => (
+            {SOURCE_CHAINS.map(chain => (
               <button
-                key={chain}
-                onClick={() => setSourceChain(chain)}
-                className={`py-2 px-2 rounded-lg text-xs font-medium border transition-all ${
-                  sourceChain === chain ? "tab-active" : "tab-inactive"
+                key={chain.id}
+                onClick={() => { setSourceChain(chain.id); setResult(null); setError(''); setSteps([]); }}
+                className={`flex flex-col items-center gap-1.5 py-3 px-2 rounded-xl border transition-all text-xs font-medium ${
+                  sourceChain === chain.id
+                    ? 'bg-indigo-500/20 border-indigo-500/40 text-indigo-300'
+                    : 'bg-white/3 border-white/8 text-gray-400 hover:bg-white/8 hover:border-white/15'
                 }`}
               >
-                {CHAIN_INFO[chain].label}
+                <span className="text-xl">{chain.icon}</span>
+                <span className="text-center leading-tight">{chain.label}</span>
               </button>
             ))}
           </div>
         </div>
 
-        {/* Route visualization */}
-        <div className="flex items-center gap-3 bg-black/30 rounded-xl p-4">
-          <ChainBadge chain={sourceChain} />
-          <div className="flex-1 flex items-center gap-2">
-            <div className="flex-1 h-px bg-gray-700 relative">
-              <div className="absolute inset-0 flex items-center justify-center">
-                <span className="bg-gray-900 px-2 text-xs text-gray-500">CCTP</span>
-              </div>
-            </div>
+        {/* Arrow */}
+        <div className="flex items-center gap-3 text-gray-600">
+          <div className="flex-1 h-px bg-white/8"></div>
+          <div className="flex items-center gap-2 text-xs text-gray-500">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 14l-7 7m0 0l-7-7m7 7V3" />
+            </svg>
+            CCTP Bridge
           </div>
-          <ChainBadge chain="Arc_Testnet" />
-        </div>
-
-        {/* Amount */}
-        <div className="bg-black/30 rounded-xl p-4">
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-gray-400 text-sm">Amount (USDC)</span>
-            {chainInfo.isSolana && (
-              <span className="text-xs text-yellow-400">Requires Phantom</span>
-            )}
-          </div>
-          <div className="flex items-center gap-3">
-            <input
-              type="number"
-              value={amount}
-              onChange={(e) => setAmount(e.target.value)}
-              step="0.01"
-              min="0.01"
-              style={{
-                background: "transparent",
-                border: "none",
-                fontSize: 24,
-                fontWeight: 700,
-                padding: 0,
-                width: "100%",
-              }}
-              placeholder="0.00"
-            />
-            <div className="flex items-center gap-2 bg-gray-800 rounded-lg px-3 py-2">
-              <div style={{ width: 18, height: 18, borderRadius: "50%", background: "#2775CA", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 7, fontWeight: 800, color: "#fff" }}>U</div>
-              <span className="font-semibold text-white text-sm">USDC</span>
-            </div>
-          </div>
+          <div className="flex-1 h-px bg-white/8"></div>
         </div>
 
         {/* Destination */}
-        <div className="text-xs text-gray-600 space-y-1">
-          <div className="flex justify-between">
-            <span>Destination</span>
-            <span className="text-gray-400 mono">{address ? `${address.slice(0,6)}…${address.slice(-4)}` : "—"}</span>
+        <div className="flex items-center gap-3 px-4 py-3 rounded-xl bg-emerald-500/5 border border-emerald-500/20">
+          <span className="text-xl">🟢</span>
+          <div className="flex-1">
+            <p className="text-sm font-medium text-white">Arc Testnet</p>
+            <p className="text-xs text-gray-500">Native USDC · Chain ID 5042002</p>
           </div>
-          <div className="flex justify-between">
-            <span>Protocol</span>
-            <span className="text-gray-400">Circle CCTP v2 · Native USDC (no wrapping)</span>
-          </div>
-          <div className="flex justify-between">
-            <span>Est. time</span>
-            <span className="text-gray-400">~1–3 min</span>
+          <span className="text-xs text-emerald-400">Destination</span>
+        </div>
+
+        {/* Amount */}
+        <div>
+          <label className="text-xs text-gray-500 mb-2 block">Amount (USDC)</label>
+          <div className="flex gap-2">
+            <input
+              type="number"
+              min="0"
+              step="0.1"
+              value={amount}
+              onChange={e => { setAmount(e.target.value); setResult(null); setError(''); }}
+              placeholder="1.00"
+              className="flex-1 px-4 py-3 rounded-xl bg-white/5 border border-white/10 text-white text-lg font-semibold focus:outline-none focus:border-indigo-500/50 transition-colors placeholder-gray-600"
+            />
+            {['1', '10', '50'].map(v => (
+              <button key={v} onClick={() => setAmount(v)} className="px-3 py-3 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-xs text-gray-400 transition-colors">
+                {v}
+              </button>
+            ))}
           </div>
         </div>
 
-        {/* CTA */}
-        {!isConnected ? (
-          <div className="bg-yellow-900/20 border border-yellow-500/20 rounded-lg p-3 text-yellow-400 text-sm text-center">
-            Connect your wallet to bridge
+        {/* Chain switch warning */}
+        {selectedSource.type === 'evm' && address && !isOnSourceChain && (
+          <div className="flex items-center justify-between px-3 py-2.5 rounded-xl bg-amber-500/10 border border-amber-500/20">
+            <p className="text-xs text-amber-400">Switch to {selectedSource.label} to bridge</p>
+            <button onClick={switchToSourceChain} className="text-xs text-amber-300 hover:text-amber-200 underline">Switch Now</button>
           </div>
-        ) : (
-          <button
-            onClick={handleBridge}
-            disabled={!amount || parseFloat(amount) <= 0 || (status !== "idle" && status !== "success" && status !== "error")}
-            className="btn-primary"
-          >
-            {status === "idle" || status === "success" || status === "error"
-              ? `Bridge ${amount || "0"} USDC → Arc Testnet`
-              : statusLabel[status]}
-          </button>
         )}
 
-        {/* Status */}
-        {status !== "idle" && status !== "error" && (
-          <div className={`rounded-lg p-4 text-sm space-y-2 ${status === "success" ? "bg-green-900/20 border border-green-500/20" : "bg-blue-900/20 border border-blue-500/20"}`}>
-            <div className="flex items-center gap-2">
-              {status !== "success" && <span className="pulse-dot bg-blue-400" style={{ flexShrink: 0 }} />}
-              <span className={status === "success" ? "text-green-400 font-semibold" : "text-blue-400"}>
-                {statusLabel[status]}
-              </span>
-            </div>
-            {txHash && (
-              <a href={`${chainInfo.explorer}/tx/${txHash}`} target="_blank" rel="noreferrer" className="explorer-link block">
-                Source tx on {chainInfo.label} →
-              </a>
-            )}
-            {destTxHash && (
-              <a href={`${EXPLORER}/tx/${destTxHash}`} target="_blank" rel="noreferrer" className="explorer-link block">
-                Destination tx on ArcScan →
-              </a>
-            )}
+        {/* Solana notice */}
+        {selectedSource.type === 'solana' && (
+          <div className="px-3 py-2.5 rounded-xl bg-violet-500/10 border border-violet-500/20 text-xs text-violet-300">
+            👻 Phantom wallet will be used for Solana. MetaMask required for receiving on Arc.
           </div>
         )}
-        {status === "error" && (
-          <div className="bg-red-900/20 border border-red-500/20 rounded-lg p-3 text-red-400 text-sm">
+
+        {/* Progress steps */}
+        {steps.length > 0 && (
+          <div className="space-y-2">
+            {steps.map((step, i) => (
+              <div key={i} className={`flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all ${
+                step.status === 'active' ? 'bg-indigo-500/10 border border-indigo-500/20' :
+                step.status === 'done' ? 'bg-emerald-500/5 border border-emerald-500/15' :
+                step.status === 'error' ? 'bg-red-500/10 border border-red-500/20' :
+                'bg-white/3 border border-white/5 opacity-50'
+              }`}>
+                <div className="w-5 h-5 flex-shrink-0 flex items-center justify-center">
+                  {step.status === 'active' && <span className="w-4 h-4 border-2 border-indigo-400/30 border-t-indigo-400 rounded-full spinner"></span>}
+                  {step.status === 'done' && <svg className="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>}
+                  {step.status === 'error' && <svg className="w-4 h-4 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>}
+                  {step.status === 'pending' && <span className="w-2 h-2 rounded-full bg-gray-600"></span>}
+                </div>
+                <span className={`text-xs flex-1 ${
+                  step.status === 'active' ? 'text-indigo-300' :
+                  step.status === 'done' ? 'text-emerald-400' :
+                  step.status === 'error' ? 'text-red-400' : 'text-gray-600'
+                }`}>{step.label}</span>
+                {step.txHash && (
+                  <a href={`https://sepolia.etherscan.io/tx/${step.txHash}`} target="_blank" rel="noopener noreferrer"
+                    className="text-xs text-gray-500 hover:text-gray-400">↗</a>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Error */}
+        {error && (
+          <div className="px-3 py-2.5 rounded-xl bg-red-500/10 border border-red-500/20 text-sm text-red-400">
             {error}
           </div>
         )}
+
+        {/* Result */}
+        {result && (
+          <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/20 space-y-3">
+            <div className="flex items-center gap-2 text-emerald-400">
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              <span className="font-medium text-sm">Bridge Successful!</span>
+            </div>
+            <p className="text-sm text-gray-300">
+              <span className="font-semibold text-white">{result.amount} USDC</span> bridged from {result.sourceChain} → Arc Testnet
+            </p>
+            {result.txHash && (
+              <a
+                href={result.explorerUrl || `${EXPLORER}/tx/${result.txHash}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-2 text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                </svg>
+                View on Explorer: {result.txHash.slice(0, 10)}…{result.txHash.slice(-6)}
+              </a>
+            )}
+          </div>
+        )}
+
+        {/* Bridge button */}
+        <button
+          onClick={executeBridge}
+          disabled={isBridging || !address}
+          className="w-full py-3.5 rounded-xl bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 disabled:opacity-50 text-white font-semibold transition-all flex items-center justify-center gap-2 text-sm"
+        >
+          {isBridging ? (
+            <><span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full spinner"></span>Bridging…</>
+          ) : !address ? 'Connect Wallet to Bridge' : `Bridge ${amount || '0'} USDC → Arc Testnet`}
+        </button>
       </div>
 
-      <p className="text-center text-xs text-gray-600 mt-4">
-        Powered by{" "}
-        <a href="https://docs.arc.network/app-kit/quickstarts/bridge-tokens-across-blockchains" target="_blank" rel="noreferrer" className="text-gray-500 hover:text-gray-400 underline">
-          Circle App Kit Bridge
-        </a>{" "}
-        · Native USDC via{" "}
-        <a href="https://www.circle.com/cross-chain-transfer-protocol" target="_blank" rel="noreferrer" className="text-gray-500 hover:text-gray-400 underline">
-          CCTP v2
-        </a>
-      </p>
-    </div>
-  );
-}
-
-function ChainBadge({ chain }: { chain: string }) {
-  const labels: Record<string, { label: string; color: string }> = {
-    Ethereum_Sepolia: { label: "ETH Sepolia", color: "#627EEA" },
-    Base_Sepolia: { label: "Base Sepolia", color: "#0052FF" },
-    Solana_Devnet: { label: "Solana Devnet", color: "#9945FF" },
-    Arc_Testnet: { label: "Arc Testnet", color: "#0066FF" },
-  };
-  const info = labels[chain] ?? { label: chain, color: "#555" };
-  return (
-    <div className="flex flex-col items-center gap-1">
-      <div
-        style={{ width: 32, height: 32, borderRadius: "50%", background: info.color, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 800, color: "#fff" }}
-      >
-        {info.label[0]}
+      {/* Info */}
+      <div className="p-4 rounded-xl bg-white/3 border border-white/8 text-xs text-gray-500 space-y-1.5">
+        <p className="font-medium text-gray-400">ℹ️ About Bridging</p>
+        <p>Uses Circle's Cross-Chain Transfer Protocol (CCTP) — native USDC is burned on the source chain and minted on Arc Testnet. No wrapped tokens.</p>
+        <p>Get testnet USDC from the <a href="https://faucet.circle.com" target="_blank" rel="noopener noreferrer" className="text-indigo-400 hover:underline">Circle Faucet</a>. Fast transfers take ~20s.</p>
       </div>
-      <span className="text-xs text-gray-400 text-center" style={{ maxWidth: 64 }}>{info.label}</span>
     </div>
   );
 }
